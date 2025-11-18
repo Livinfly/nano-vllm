@@ -22,16 +22,16 @@ class LLMEngine:
         self.events = []
         ctx = mp.get_context("spawn")
         for i in range(1, config.tensor_parallel_size):
-            event = ctx.Event()
+            event = ctx.Event() # Event & shared memory => Single-Node Multi-GPU
             process = ctx.Process(target=ModelRunner, args=(config, i, event))
             process.start()
             self.ps.append(process)
             self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        self.model_runner = ModelRunner(config, 0, self.events) # main process, have all other GPUs' events
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True) # eos, encode and decode
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
-        atexit.register(self.exit)
+        atexit.register(self.exit) # callback, TODO: when exception exits?
 
     def exit(self):
         self.model_runner.call("exit")
@@ -39,21 +39,21 @@ class LLMEngine:
         for p in self.ps:
             p.join()
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+    def _add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
 
-    def step(self):
+    def step(self): # process one step
         seqs, is_prefill = self.scheduler.schedule()
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
+        token_ids = self.model_runner.call("run", seqs, is_prefill) # distributedly call run
         self.scheduler.postprocess(seqs, token_ids)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished] # finished seqs
+        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs) # process prefill tokens / decode one token
         return outputs, num_tokens
 
-    def is_finished(self):
+    def _is_finished(self):
         return self.scheduler.is_finished()
 
     def generate(
@@ -63,17 +63,17 @@ class LLMEngine:
         use_tqdm: bool = True,
     ) -> list[str]:
         if use_tqdm:
-            pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
-        if not isinstance(sampling_params, list):
+            pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True) # verbose
+        if not isinstance(sampling_params, list): # sampling_params fit the shape
             sampling_params = [sampling_params] * len(prompts)
-        for prompt, sp in zip(prompts, sampling_params):
-            self.add_request(prompt, sp)
+        for prompt, sp in zip(prompts, sampling_params): # offline, add all requests
+            self._add_request(prompt, sp)
         outputs = {}
         prefill_throughput = decode_throughput = 0.
-        while not self.is_finished():
+        while not self._is_finished():
             t = perf_counter()
-            output, num_tokens = self.step()
-            if use_tqdm:
+            output, num_tokens = self.step() # get output
+            if use_tqdm: # verbose
                 if num_tokens > 0:
                     prefill_throughput = num_tokens / (perf_counter() - t)
                 else:
@@ -83,11 +83,11 @@ class LLMEngine:
                     "Decode": f"{int(decode_throughput)}tok/s",
                 })
             for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
-                if use_tqdm:
+                outputs[seq_id] = token_ids # generated token_ids
+                if use_tqdm: # verbose
                     pbar.update(1)
-        outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
-        if use_tqdm:
+        outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())] # reorder
+        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs] # post-process
+        if use_tqdm: # verbose
             pbar.close()
         return outputs

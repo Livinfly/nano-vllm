@@ -31,7 +31,7 @@ class Scheduler:
             if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
                 break
             num_seqs += 1
-            self.block_manager.allocate(seq)
+            self.block_manager.allocate(seq) # allocate at once
             num_batched_tokens += len(seq) - seq.num_cached_tokens
             seq.status = SequenceStatus.RUNNING
             self.waiting.popleft()
@@ -41,9 +41,9 @@ class Scheduler:
             return scheduled_seqs, True
 
         # decode
-        while self.running and num_seqs < self.max_num_seqs:
+        while self.running and num_seqs < self.max_num_seqs: # ease the code logic, schedule the step
             seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
+            while not self.block_manager.can_append(seq): # allocate progressively
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
@@ -51,18 +51,18 @@ class Scheduler:
                     break
             else:
                 num_seqs += 1
-                self.block_manager.may_append(seq)
+                self.block_manager.may_append(seq) # allocate progressively
                 scheduled_seqs.append(seq)
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
 
-    def preempt(self, seq: Sequence):
+    def preempt(self, seq: Sequence): # preempt a running sequence (seq)
         seq.status = SequenceStatus.WAITING
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
+    def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]: # append new token
         for seq, token_id in zip(seqs, token_ids):
             seq.append_token(token_id)
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
